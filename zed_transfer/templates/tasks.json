@@ -1,0 +1,23 @@
+[
+  {
+    "label": "Zed Transfer · Verifica configurazione",
+    "command": "zed-transfer",
+    "args": ["check"]
+  },
+  {
+    "label": "Zed Transfer · Elenca file remoti",
+    "command": "zed-transfer",
+    "args": ["list"]
+  },
+  {
+    "label": "Zed Transfer · Carica file corrente",
+    "command": "zed-transfer",
+    "args": ["upload"],
+    "save": "current"
+  },
+  {
+    "label": "Zed Transfer · Scarica file corrente",
+    "command": "zed-transfer",
+    "args": ["download"]
+  }
+]

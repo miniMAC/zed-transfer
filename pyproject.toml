@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zed-transfer"
+version = "0.1.0"
+description = "SFTP and FTP transfers from Zed with VS Code SFTP project configs"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+classifiers = [
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+]
+
+[project.urls]
+Repository = "https://github.com/miniMAC/zed-transfer"
+
+[project.scripts]
+zed-transfer = "zed_transfer.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["zed_transfer*"]
+namespaces = false
+
+[tool.setuptools.package-data]
+zed_transfer = ["templates/*.json"]
