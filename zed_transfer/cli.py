@@ -7,13 +7,17 @@ import io
 import os
 import sys
 import warnings
+from collections.abc import Iterator
+from contextlib import contextmanager
 from importlib import resources
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from urllib.parse import quote
 
+from .auto_authorization import AuthorizationError, authorize, get_authorization, revoke, verify_authorization
 from .config import Config, ConfigError, load_config
 from .local import LocalError, existing_file, install_file, project_parent, snapshot_upload
+from .lsp import run_lsp
 from .paths import transfer_paths
 from .transport import TransportError, open_transport
 
@@ -32,6 +36,9 @@ def _parser() -> argparse.ArgumentParser:
     commands.add_parser("check", help="Verifica la configurazione in locale")
     commands.add_parser("list", help="Elenca il contenuto della directory remota")
     commands.add_parser("install-zed", help="Installa i task Zed nel progetto")
+    commands.add_parser("enable-auto-upload", help="Autorizza l'upload al salvataggio per il progetto")
+    commands.add_parser("disable-auto-upload", help="Revoca l'autorizzazione per il progetto")
+    commands.add_parser("lsp", help="Avvia il server locale usato dall'estensione Zed")
     for command, description in (("upload", "Carica un file"), ("download", "Scarica un file")):
         transfer = commands.add_parser(command, help=description)
         transfer.add_argument("file", nargs="?", help="Percorso nel progetto, oppure il file attivo in Zed")
@@ -86,7 +93,11 @@ def _check(config: Config) -> None:
     if isinstance(config.password, str) and config.password:
         print("Il JSON contiene una password. Il tool la chiede al terminale per impostazione predefinita.")
     if config.upload_on_save:
-        print("uploadOnSave è presente. Usa il task di caricamento manuale dopo il salvataggio.")
+        auth = get_authorization(config.root)
+        if auth is not None and verify_authorization(auth, config):
+            print("Upload al salvataggio autorizzato. Zed deve avere l'estensione Zed Transfer attiva.")
+        else:
+            print("uploadOnSave è presente. Usa enable-auto-upload per autorizzare il progetto.")
     if config.unsupported:
         print(f"Opzioni senza effetto in Zed Transfer: {_display(', '.join(config.unsupported))}")
 
@@ -113,6 +124,81 @@ def _protect_local(config: Config, local: Path) -> None:
         raise LocalError("Il percorso locale è protetto dai trasferimenti.")
 
 
+@contextmanager
+def _upload_snapshot(config: Config, local: Path) -> Iterator[Path]:
+    with project_parent(config.root, local, workspace_identity=config.workspace_identity) as directory:
+        with TemporaryDirectory(prefix="zed-transfer-") as temporary:
+            staged = Path(temporary) / "data"
+            snapshot_upload(directory, local.name, staged)
+            yield staged
+
+
+def _enable_auto_upload(args: argparse.Namespace, config: Config) -> None:
+    if not config.upload_on_save:
+        raise LocalError('Imposta "uploadOnSave": true nel profilo scelto.')
+    if config.protocol == "ftp":
+        raise LocalError("Per l'upload automatico usa SFTP o FTPS.")
+    if args.password or config.password is True:
+        raise LocalError("Per l'upload automatico usa una chiave SSH o autorizza la password già nel JSON.")
+    if config.password or config.protocol == "ftps":
+        if not args.allow_config_password or not isinstance(config.password, str):
+            raise LocalError("Per usare la password già nel JSON, aggiungi --allow-config-password prima del comando.")
+    message = (
+        f"Autorizza i salvataggi in Zed da {_display(config.context)} a {_endpoint(config, config.remote_path)}.\n"
+        "I file sul server possono essere sostituiti automaticamente."
+    )
+    if config.remote_temp_path is not None:
+        message += f"\nDirectory temporanea remota {_display(config.remote_temp_path)}."
+    if args.allow_config_password and isinstance(config.password, str):
+        message += "\nVerrà usata la password già presente nel JSON."
+    _confirm(message)
+    authorize(config, allow_config_password=args.allow_config_password)
+    print("Upload al salvataggio autorizzato. Apri il progetto in Zed con l'estensione Zed Transfer attiva.")
+
+
+def _auto_upload(root: Path, workspace: Path, file: Path) -> str | None:
+    if not file.is_relative_to(workspace) or workspace.resolve(strict=True) != root:
+        return None
+    try:
+        auth = get_authorization(root)
+    except AuthorizationError as error:
+        return f"Zed Transfer · {_display(str(error))}"
+    if auth is None:
+        return None
+
+    try:
+        config = load_config(root, path=auth.config_path, name=auth.name, profile=auth.profile)
+    except ConfigError:
+        return "Zed Transfer · Configurazione cambiata o non valida. Verificala con zed-transfer check."
+    if not config.upload_on_save:
+        return None
+    if not verify_authorization(auth, config):
+        return "Zed Transfer · Configurazione cambiata. Conferma di nuovo con enable-auto-upload."
+
+    if config.protocol == "ftp" or config.password is True:
+        return None
+    password = config.password if auth.allow_config_password and isinstance(config.password, str) else None
+    if password is None and (config.password or config.protocol == "ftps"):
+        return None
+
+    try:
+        local, remote = transfer_paths(config, file.relative_to(workspace))
+        _protect_local(config, local)
+    except (ConfigError, LocalError):
+        return None
+    try:
+        with _upload_snapshot(config, local) as staged:
+            if get_authorization(root) != auth:
+                return None
+            with open_transport(config, password) as transport:
+                transport.upload(staged, remote)
+    except (AuthorizationError, LocalError, TransportError) as error:
+        return f"Zed Transfer · Upload non riuscito per {_display(local.name)}. {_display(str(error))}"
+    except OSError:
+        return f"Zed Transfer · Impossibile leggere o caricare {_display(local.name)}."
+    return f"Zed Transfer · Caricato {_endpoint(config, remote)}"
+
+
 def _transfer(args: argparse.Namespace, config: Config) -> None:
     file = args.file if args.file is not None else os.environ.get("ZED_RELATIVE_FILE")
     if not file:
@@ -121,28 +207,24 @@ def _transfer(args: argparse.Namespace, config: Config) -> None:
     _protect_local(config, local)
     destination = _endpoint(config, remote)
 
-    with project_parent(config.root, local) as directory, TemporaryDirectory(prefix="zed-transfer-") as temporary:
-        staged = Path(temporary) / "data"
-        if args.command == "upload":
-            snapshot_upload(directory, local.name, staged)
-            message = f"Carica {_display(local)} su {destination}. Il file remoto potrebbe essere sostituito."
-            if config.remote_temp_path is not None:
-                message += f" Directory temporanea remota {_display(config.remote_temp_path)}."
+    if args.command == "upload":
+        message = f"Carica {_display(local)} su {destination}. Il file remoto potrebbe essere sostituito."
+        if config.remote_temp_path is not None:
+            message += f" Directory temporanea remota {_display(config.remote_temp_path)}."
+        with _upload_snapshot(config, local) as staged:
             _confirm(message)
-        else:
+            with open_transport(config, _password(args, config), allow_insecure_ftp=args.allow_insecure_ftp) as transport:
+                transport.upload(staged, remote)
+    else:
+        with project_parent(config.root, local) as directory, TemporaryDirectory(prefix="zed-transfer-") as temporary:
+            staged = Path(temporary) / "data"
             original = existing_file(directory, local.name)
             message = f"Scarica {destination} in {_display(local)}."
             if original is not None:
                 message += " Il file locale sarà sostituito."
             _confirm(message)
-
-        with open_transport(config, _password(args, config), allow_insecure_ftp=args.allow_insecure_ftp) as transport:
-            if args.command == "upload":
-                transport.upload(staged, remote)
-            else:
+            with open_transport(config, _password(args, config), allow_insecure_ftp=args.allow_insecure_ftp) as transport:
                 transport.download(remote, staged)
-
-        if args.command == "download":
             with staged.open("rb") as downloaded:
                 install_file(directory, local.name, downloaded, original)
     print("Trasferimento completato.")
@@ -160,9 +242,18 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "install-zed":
             _install_zed(root)
             return 0
+        if args.command == "disable-auto-upload":
+            revoke(root)
+            print("Upload al salvataggio disattivato per questo progetto.")
+            return 0
+        if args.command == "lsp":
+            return run_lsp(lambda workspace, file: _auto_upload(root, workspace, file))
         config = load_config(root, path=args.config, name=args.name, profile=args.profile)
         if args.command == "check":
             _check(config)
+            return 0
+        if args.command == "enable-auto-upload":
+            _enable_auto_upload(args, config)
             return 0
         if config.protocol == "ftp" and not args.allow_insecure_ftp:
             raise LocalError("FTP in chiaro richiede --allow-insecure-ftp. Abilita FTPS o SFTP se disponibili.")
@@ -173,7 +264,7 @@ def main(argv: list[str] | None = None) -> int:
                     print(_display(line))
         else:
             _transfer(args, config)
-    except (ConfigError, LocalError, TransportError) as error:
+    except (AuthorizationError, ConfigError, LocalError, TransportError) as error:
         print(f"Errore. {_display(str(error))}", file=sys.stderr)
         return 1
     except OSError as error:

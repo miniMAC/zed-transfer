@@ -2,7 +2,7 @@
 
 Carica e scarica singoli file da Zed via SFTP, FTPS esplicito o FTP. Puoi riusare il tuo `.vscode/sftp.json` e avviare i trasferimenti dal pannello **Tasks** di Zed o dal terminale.
 
-Il progetto si ispira a [zed-sftp](https://github.com/andreyc0d3r/zed-sftp) e usa i task integrati di Zed. I trasferimenti partono su richiesta e il tool mostra la destinazione prima di chiedere conferma.
+Il progetto si ispira a [zed-sftp](https://github.com/andreyc0d3r/zed-sftp) e usa i task integrati di Zed per i trasferimenti manuali. Un'estensione opzionale permette di caricare automaticamente i file al salvataggio nei progetti che autorizzi.
 
 ## Installazione su macOS e Linux
 
@@ -64,8 +64,9 @@ Con questo profilo `site/wp-content/themes/mio-tema/style.css` corrisponde a `/p
 | `name` | Per un array di server, `--name "WordPress staging"` seleziona l'elemento corrispondente. |
 | `ignore`, `connectTimeout` | Esclusioni relative a `context` con `*`, `?` e `**` come segmento intero. Timeout di connessione in millisecondi. |
 | `secure` | Con `protocol: "ftp"`, imposta `true` per FTPS esplicito. |
+| `uploadOnSave` | Con `true`, abilita l'upload al salvataggio dopo aver installato l'estensione e autorizzato il progetto. |
 
-`uploadOnSave`, `downloadOnOpen`, i watcher e le opzioni di sincronizzazione di VS Code riguardano operazioni automatiche. Zed Transfer lavora su un singolo file alla volta e avvia le operazioni solo dopo il tuo comando. `check` segnala le opzioni inattive e restituisce un errore per modalità di connessione incompatibili, come salti SSH o opzioni TLS personalizzate.
+Zed Transfer lavora su un singolo file alla volta. `check` segnala le opzioni inattive, come `downloadOnOpen` e i watcher di VS Code, e restituisce un errore per modalità di connessione incompatibili, come salti SSH o opzioni TLS personalizzate.
 
 ### Prima connessione SFTP
 
@@ -120,6 +121,38 @@ zed-transfer --name "WordPress staging" check
 ```
 
 Se i task non trovano il comando, esegui `pipx ensurepath`, riavvia Zed e controlla che `zed-transfer --help` funzioni nel suo terminale integrato.
+
+## Upload automatico al salvataggio
+
+L'estensione riceve da Zed l'evento di salvataggio dei file delle lingue che supporta, tra cui PHP, JavaScript, TypeScript, HTML e CSS. Le modifiche su disco effettuate da altri programmi e i cambi di branch Git non avviano upload. I task globali possono essere usati anche con l'estensione installata.
+
+### Installa l'estensione una volta
+
+1. Se avevi già installato il tool con `pipx` da GitHub, aggiornalo con `pipx reinstall zed-transfer`. Se è la prima installazione, usa il comando `pipx install` qui sopra.
+2. Installa Rust tramite [rustup](https://rustup.rs/) e clona il sorgente con `git clone https://github.com/miniMAC/zed-transfer.git` in una cartella a tua scelta. Se hai già il clone, aggiornalo con `git pull`.
+3. In Zed, dalla palette dei comandi, esegui **`zed: install dev extension`** e seleziona la sottocartella `extension` dentro `zed-transfer`. Tieni la cartella in quella posizione finché usi l'estensione locale. Poi apri o riapri il progetto del sito.
+
+Zed deve riconoscere la lingua del file. Per PHP verifica che l'estensione **PHP** sia installata e che nell'angolo in basso a destra compaia **PHP** quando apri `index.php`. Se hai personalizzato `language_servers` per la lingua con una lista esplicita, aggiungi `transfer-on-save-lsp` alla lista esistente.
+
+### Autorizza il sito
+
+Nel `.vscode/sftp.json` del progetto imposta `"uploadOnSave": true`. Dal terminale integrato di Zed, nella cartella del sito, esegui:
+
+```sh
+zed-transfer enable-auto-upload
+```
+
+Controlla l'indirizzo e la directory remota prima di confermare. Da quel momento, salvando in Zed un file incluso in `context` e non escluso da `ignore`, il tool può sostituire quel file sul server. L'autorizzazione è locale a questo Mac e a questo profilo. Se modifichi il JSON approvato, conferma nuovamente con lo stesso comando. Verifica con `zed-transfer check`, usando gli stessi flag di selezione se hai più profili o server.
+
+L'upload automatico supporta SFTP e FTPS. Per SFTP con chiave o agente SSH usa il comando precedente. Se il JSON contiene già la password di un server SFTP o FTPS, puoi autorizzarne l'uso con:
+
+```sh
+zed-transfer --allow-config-password enable-auto-upload
+```
+
+L'upload automatico richiede credenziali disponibili senza prompt. Con `"password": true` puoi continuare a usare i task manuali. Per vedere l'esito dei trasferimenti, apri **`dev: open language server logs`** e seleziona **Zed Transfer on Save**. Se il server non parte, consulta **`zed: open log`**.
+
+Per disattivare l'upload al salvataggio esegui `zed-transfer disable-auto-upload` dalla cartella del progetto.
 
 ## Come vengono protetti i trasferimenti
 

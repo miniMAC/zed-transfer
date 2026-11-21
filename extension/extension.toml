@@ -1,0 +1,14 @@
+id = "transfer-on-save-lsp"
+name = "Zed Transfer on Save"
+version = "0.1.0"
+schema_version = 1
+authors = ["miniMAC"]
+description = "Send Zed's save notifications to a locally installed Zed Transfer client."
+repository = "https://github.com/miniMAC/zed-transfer"
+
+[language_servers.transfer-on-save-lsp]
+name = "Zed Transfer on Save"
+languages = [
+    "CSS", "HTML", "JavaScript", "JSON", "JSONC", "Markdown", "PHP",
+    "Plain Text", "Python", "SQL", "TSX", "TypeScript", "XML", "YAML",
+]

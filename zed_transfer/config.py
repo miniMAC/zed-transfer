@@ -1,6 +1,7 @@
 """Read the VS Code SFTP project configuration without executing workspace code."""
 
 import fnmatch
+import hashlib
 import ipaddress
 import json
 import math
@@ -20,6 +21,8 @@ class ConfigError(ValueError):
 class Config:
     root: Path
     source: Path
+    source_fingerprint: str = field(repr=False)
+    workspace_identity: tuple[int, int]
     context: Path
     name: str | None
     profile: str | None
@@ -38,7 +41,6 @@ class Config:
 
 
 _MAX_CONFIG = 128 * 1024
-_MISSING = object()
 _JSON_STRING = r'"(?:\\.|[^"\\])*"'
 _COMMENT_OR_STRING = re.compile(_JSON_STRING + r"|//[^\r\n]*|/\*[\s\S]*?\*/")
 _TRAILING_COMMA_OR_STRING = re.compile(_JSON_STRING + r"|,(?=[ \t\r\n]*[}\]])")
@@ -128,7 +130,9 @@ def _workspace_path(root: Path, path: str | Path, *, label: str) -> Path:
     return absolute
 
 
-def _read_config(root: Path, source: Path, *, allow_missing: bool = False) -> object:
+def _read_config(
+    root: Path, source: Path, *, allow_missing: bool = False
+) -> tuple[bytes, tuple[int, int]] | None:
     parts = source.relative_to(root).parts
     if not parts:
         raise ConfigError("La configurazione deve essere un file regolare.")
@@ -136,6 +140,7 @@ def _read_config(root: Path, source: Path, *, allow_missing: bool = False) -> ob
     try:
         current = os.open(root, directory_flags)
         try:
+            root_info = os.fstat(current)
             for part in parts[:-1]:
                 child = os.open(part, directory_flags, dir_fd=current)
                 os.close(current)
@@ -149,7 +154,7 @@ def _read_config(root: Path, source: Path, *, allow_missing: bool = False) -> ob
             os.close(current)
     except FileNotFoundError:
         if allow_missing:
-            return _MISSING
+            return None
         raise ConfigError("Il file di configurazione non esiste.") from None
     except OSError:
         raise ConfigError(
@@ -158,19 +163,23 @@ def _read_config(root: Path, source: Path, *, allow_missing: bool = False) -> ob
         ) from None
     if len(raw) > _MAX_CONFIG:
         raise ConfigError("La configurazione supera la dimensione massima di 128 KiB.")
-    return _parse_jsonc(raw)
+    return raw, (root_info.st_dev, root_info.st_ino)
 
 
-def _load_source(root: Path, path: Path | None) -> tuple[Path, object]:
+def _load_source(root: Path, path: Path | None) -> tuple[Path, bytes, tuple[int, int]]:
     if path is not None:
         source = _workspace_path(root, path, label="Il file di configurazione")
-        return source, _read_config(root, source)
-    source = root / ".vscode" / "sftp.json"
-    data = _read_config(root, source, allow_missing=True)
-    if data is _MISSING:
-        source = root / ".zed" / "sftp.json"
-        data = _read_config(root, source)
-    return source, data
+        loaded = _read_config(root, source)
+    else:
+        source = root / ".vscode" / "sftp.json"
+        loaded = _read_config(root, source, allow_missing=True)
+        if loaded is None:
+            source = root / ".zed" / "sftp.json"
+            loaded = _read_config(root, source)
+    if loaded is None:
+        raise ConfigError("Il file di configurazione non esiste.")
+    raw, identity = loaded
+    return source, raw, identity
 
 
 def _select_server(data: object, name: str | None) -> dict[str, object]:
@@ -351,8 +360,8 @@ def load_config(
         raise ConfigError("Impossibile aprire la directory del workspace.") from None
     if not root.is_dir():
         raise ConfigError("Il workspace deve essere una directory.")
-    source, raw = _load_source(root, path)
-    server = _select_server(raw, name)
+    source, raw, identity = _load_source(root, path)
+    server = _select_server(_parse_jsonc(raw), name)
     data, selected_profile = _apply_profile(server, profile)
     for key in sorted(_REJECTED.intersection(data)):
         if data[key] is not None and data[key] is not False:
@@ -398,6 +407,8 @@ def load_config(
     return Config(
         root=root,
         source=source,
+        source_fingerprint=hashlib.sha256(raw).hexdigest(),
+        workspace_identity=identity,
         context=context,
         name=_text(config_name, "name") if config_name is not None else None,
         profile=selected_profile,

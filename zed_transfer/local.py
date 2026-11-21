@@ -19,13 +19,19 @@ def _directory_flags() -> int:
 
 
 @contextmanager
-def project_parent(root: Path, path: Path, *, create_zed: bool = False) -> Iterator[int]:
+def project_parent(
+    root: Path, path: Path, *, create_zed: bool = False, workspace_identity: tuple[int, int] | None = None,
+) -> Iterator[int]:
     parts = path.relative_to(root).parts
     if not parts or ".." in parts:
         raise LocalError("Percorso locale fuori dal progetto.")
 
     directory = os.open(root, _directory_flags())
     try:
+        if workspace_identity is not None:
+            info = os.fstat(directory)
+            if (info.st_dev, info.st_ino) != workspace_identity:
+                raise LocalError("La directory del progetto è cambiata. Riapri il progetto e verifica la configurazione.")
         if create_zed:
             # This operation is only used to install the packaged .zed/tasks.json.
             try:
