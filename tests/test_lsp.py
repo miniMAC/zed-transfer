@@ -5,11 +5,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from zed_transfer.lsp import SavePrompt, run_lsp
+from zed_transfer.lsp import MenuPrompt, MenuResult, SavePrompt, TransferResult, UploadJob, run_lsp
 
 
 _PROMPT_ID = "zed-transfer-consent-" + "a" * 32
 _ACCEPT = {"title": "Attiva upload automatico"}
+_PROGRESS_ID = "zed-transfer-upload-" + "a" * 32
+_MENU_ID = "zed-transfer-menu-" + "a" * 32
+_MENU_COMMAND = "zed-transfer.config"
 
 
 def _packet(payload):
@@ -49,14 +52,19 @@ class LspTest(unittest.TestCase):
         self.uploads.append((root, file))
         return "Salvataggio ricevuto."
 
-    def run_packets(self, *packets, on_save=None):
+    def run_packets(self, *packets, on_save=None, menu=None, tokens=()):
         destination = io.BytesIO()
-        with patch("zed_transfer.lsp.token_hex", return_value="a" * 32):
-            status = run_lsp(on_save or self.on_save, stdin=io.BytesIO(b"".join(packets)), stdout=destination)
+        token_values = iter(tokens)
+        with patch("zed_transfer.lsp.token_hex", side_effect=lambda size: next(token_values, "a" * 32)):
+            status = run_lsp(
+                on_save or self.on_save, menu=menu, stdin=io.BytesIO(b"".join(packets)), stdout=destination,
+            )
         return status, _responses(destination.getvalue())
 
-    def initialize(self):
-        return _message("initialize", id=1, params={"rootUri": self.root.as_uri()})
+    def initialize(self, **window):
+        return _message("initialize", id=1, params={
+            "rootUri": self.root.as_uri(), "capabilities": {"window": window},
+        })
 
     def test_only_did_save_after_initialize_triggers_callback(self):
         file = self.root / "file con spazi # è.php"
@@ -218,3 +226,108 @@ class LspTest(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual(len(responses), 3)
         self.assertEqual(self.uploads, [])
+
+    def _job(self, root, path, *, success=True):
+        def transfer():
+            self.uploads.append((root, path))
+            detail = "Caricato" if success else "Caricamento non riuscito"
+            return TransferResult(f"{detail} {path.name}", success)
+        return UploadJob(path.name, transfer)
+
+    def test_upload_progress_waits_for_matching_ack_and_reports_success(self):
+        file = self.root / "[index].php"
+        status, responses = self.run_packets(
+            self.initialize(workDoneProgress=True), _message("initialized"), _save(file.as_uri()),
+            _response("wrong", result=None), _response(_PROGRESS_ID, result=None),
+            _response(_PROGRESS_ID, result=None), on_save=self._job,
+        )
+        self.assertEqual(status, 0)
+        self.assertEqual(self.uploads, [(self.root, file)])
+        self.assertEqual([item["method"] for item in responses[1:]], [
+            "window/logMessage", "window/workDoneProgress/create", "$/progress", "$/progress",
+            "window/logMessage", "window/showMessage",
+        ])
+        self.assertEqual(responses[2]["id"], _PROGRESS_ID)
+        self.assertEqual([responses[3]["params"]["value"]["kind"], responses[4]["params"]["value"]["kind"]],
+                         ["begin", "end"])
+        self.assertEqual(responses[-1]["params"], {"type": 3, "message": r"✅ Caricato \[index\]\.php"})
+
+    def test_refused_or_unsupported_progress_still_reports_failed_transfer(self):
+        file = self.root / "index.php"
+        for supported in (False, True):
+            with self.subTest(workDoneProgress=supported):
+                refusal = (_response(_PROGRESS_ID, error={"code": -32601, "message": "Not supported"}),)
+                _, responses = self.run_packets(
+                    self.initialize(workDoneProgress=supported), _message("initialized"), _save(file.as_uri()),
+                    *(refusal if supported else ()),
+                    on_save=lambda root, path: self._job(root, path, success=False),
+                )
+                self.assertNotIn("$/progress", [item.get("method") for item in responses])
+                self.assertEqual(responses[-1]["params"]["type"], 1)
+                self.assertEqual(responses[-2]["params"]["type"], 1)
+        self.assertEqual(len(self.uploads), 2)
+
+    def test_pending_progress_coalesces_repeated_saves_and_shutdown_drops_unstarted_job(self):
+        first, second, third = (self.root / f"{name}.php" for name in ("first", "second", "third"))
+        second_token = "zed-transfer-upload-" + "b" * 32
+        third_token = "zed-transfer-upload-" + "c" * 32
+        status, _ = self.run_packets(
+            self.initialize(workDoneProgress=True), _message("initialized"), _save(first.as_uri()),
+            _save(second.as_uri()), _save(second.as_uri()), _save(third.as_uri()),
+            _response(_PROGRESS_ID, result=None), _response(second_token, result=None),
+            _message("shutdown", id=2), _response(third_token, result=None), _message("exit"),
+            on_save=self._job, tokens=("a" * 32, "b" * 32, "c" * 32),
+        )
+        self.assertEqual(status, 0)
+        self.assertEqual(self.uploads, [(self.root, first), (self.root, second)])
+
+    def test_progress_ack_timeout_runs_job_without_progress_even_if_input_is_ready(self):
+        file = self.root / "index.php"
+        with patch("zed_transfer.lsp.monotonic", side_effect=(0.0, 5.0)):
+            _, responses = self.run_packets(
+                self.initialize(workDoneProgress=True), _message("initialized"), _save(file.as_uri()),
+                _response(_PROGRESS_ID, result=None), on_save=self._job,
+            )
+        self.assertEqual(self.uploads, [(self.root, file)])
+        self.assertNotIn("$/progress", [item.get("method") for item in responses])
+        self.assertEqual(responses[-1]["method"], "window/showMessage")
+
+    def test_code_action_and_codelens_open_same_scoped_menu(self):
+        file = self.root / "index.php"
+        file.write_text("data")
+        roots, choices = [], []
+
+        def menu(root):
+            roots.append(root)
+            return MenuPrompt("Scegli", ("Apri", "Annulla"), select)
+
+        def select(choice):
+            choices.append(choice)
+            return MenuResult("File aperto", file)
+
+        document = {"uri": file.as_uri()}
+        status, responses = self.run_packets(
+            self.initialize(showDocument={"support": True}), _message("initialized"),
+            _message("textDocument/codeAction", id=2, params={"textDocument": document}),
+            _message("textDocument/codeLens", id=3, params={"textDocument": document}),
+            _message("textDocument/codeAction", id=4, params={
+                "textDocument": document, "context": {"triggerKind": 2},
+            }),
+            _message("workspace/executeCommand", id=5, params={"command": _MENU_COMMAND, "arguments": ["/tmp"]}),
+            _message("workspace/executeCommand", id=6, params={"command": _MENU_COMMAND}),
+            _save(file.as_uri()),
+            _response(_MENU_ID, result={"title": "not offered"}), _response(_MENU_ID, result={"title": "Apri"}),
+            _response(_MENU_ID, result={"title": "Apri"}), menu=menu, on_save=self._job,
+        )
+        self.assertEqual(status, 0)
+        self.assertEqual(roots, [self.root])
+        self.assertEqual(choices, ["Apri"])
+        self.assertEqual(self.uploads, [(self.root, file)])
+        identifiers = {item.get("id"): item for item in responses}
+        command = identifiers[2]["result"][0]["command"]
+        self.assertEqual(command["command"], _MENU_COMMAND)
+        self.assertEqual(identifiers[3]["result"][0]["command"], command)
+        self.assertEqual(identifiers[4]["result"], [])
+        self.assertIn("error", identifiers[5])
+        self.assertEqual(responses[-1]["method"], "window/showDocument")
+        self.assertEqual(responses[-1]["params"]["uri"], file.resolve().as_uri())

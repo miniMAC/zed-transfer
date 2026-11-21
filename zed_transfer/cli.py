@@ -18,8 +18,9 @@ from urllib.parse import quote
 from .auto_authorization import Authorization, AuthorizationError, authorize, get_auto_upload_status, revoke, verify_authorization
 from .config import Config, ConfigError, load_config
 from .local import LocalError, existing_file, install_file, project_parent, snapshot_upload
-from .lsp import SavePrompt, run_lsp
+from .lsp import MenuPrompt, MenuResult, SavePrompt, TransferResult, UploadJob, run_lsp
 from .paths import transfer_paths
+from .presets import PresetError, create_project_config, project_config_path, save_custom_preset
 from .transport import TransportError, open_transport
 
 
@@ -40,6 +41,9 @@ def _parser() -> argparse.ArgumentParser:
     commands.add_parser("enable-auto-upload", help="Autorizza l'upload al salvataggio per il progetto")
     commands.add_parser("disable-auto-upload", help="Revoca l'autorizzazione per il progetto")
     commands.add_parser("lsp", help="Avvia il server locale usato dall'estensione Zed")
+    init = commands.add_parser("init", help="Crea .vscode/sftp.json da un modello")
+    init.add_argument("preset", choices=("sftp-key", "sftp-password", "ftps", "custom"))
+    commands.add_parser("save-preset", help="Salva la configurazione come modello personale senza credenziali")
     for command, description in (("upload", "Carica un file"), ("download", "Scarica un file")):
         transfer = commands.add_parser(command, help=description)
         transfer.add_argument("file", nargs="?", help="Percorso nel progetto, oppure il file attivo in Zed")
@@ -121,6 +125,53 @@ def _install_zed(root: Path) -> None:
     print("Task installati in .zed/tasks.json. Apri la palette di Zed e cerca task: spawn.")
 
 
+def _preset_menu(root: Path, workspace: Path) -> MenuPrompt | MenuResult | None:
+    try:
+        if workspace.resolve(strict=True) != root:
+            return None
+        existing = project_config_path(root)
+    except (OSError, RuntimeError, PresetError) as error:
+        return MenuResult(f"Impossibile aprire la configurazione locale. {_display(str(error))}")
+
+    templates = {
+        "Crea JSON · SFTP con chiave": "sftp-key",
+        "Crea JSON · SFTP con password": "sftp-password",
+        "Crea JSON · FTPS": "ftps",
+        "Crea JSON dal modello personale": "custom",
+    }
+    open_json = "Apri sftp.json"
+    save_preset = "Salva come modello personale"
+    if existing is None:
+        message = "Scegli il modello per creare `.vscode/sftp.json` in questo progetto."
+        actions = tuple(templates)
+    else:
+        message = (
+            "Apri il JSON del progetto per modificarlo. Salvarlo come modello personale "
+            "aggiorna il modello riutilizzabile senza copiare la password."
+        )
+        actions = (open_json, save_preset)
+
+    def select(action: str) -> MenuResult | None:
+        try:
+            if action == open_json:
+                path = project_config_path(root)
+                return MenuResult("Configurazione del progetto." if path else "Il file sftp.json non esiste più.", path)
+            if action == save_preset:
+                save_custom_preset(root)
+                return MenuResult("Modello personale salvato. Puoi usarlo negli altri progetti.")
+            preset = templates.get(action)
+            if preset is not None:
+                path = create_project_config(root, preset)
+                return MenuResult("Creato .vscode/sftp.json. Controlla i dati della connessione prima di usarlo.", path)
+        except (LocalError, PresetError, ConfigError) as error:
+            return MenuResult(_display(str(error)))
+        except OSError:
+            return MenuResult("Impossibile leggere o scrivere la configurazione locale.")
+        return None
+
+    return MenuPrompt(message, actions, select)
+
+
 def _protect_local(config: Config, local: Path) -> None:
     parts = {part.casefold() for part in local.relative_to(config.root).parts}
     protected = {
@@ -182,24 +233,31 @@ def _read_auto_config(root: Path, auth: Authorization | None) -> Config:
 def _upload_approved(
     config: Config, local: Path, remote: str, auth: Authorization,
     *, expected_source: os.stat_result | None = None,
-) -> str | None:
-    password = config.password if auth.allow_config_password and isinstance(config.password, str) else None
-    if (config.password or config.protocol == "ftps") and password is None:
-        return "Zed Transfer · L'upload automatico richiede credenziali disponibili senza prompt."
+) -> TransferResult | None:
+    filename = _display(local.name)
     try:
+        if get_auto_upload_status(config.root) != (auth, False):
+            return None
+        if not verify_authorization(auth, _read_auto_config(config.root, auth)):
+            raise LocalError("Configurazione cambiata. Salva di nuovo per controllare la destinazione.")
+        password = config.password if auth.allow_config_password and isinstance(config.password, str) else None
+        if (config.password or config.protocol == "ftps") and password is None:
+            raise LocalError("L'upload automatico richiede credenziali disponibili senza prompt.")
         with _upload_snapshot(config, local, expected_source=expected_source) as staged:
             if get_auto_upload_status(config.root) != (auth, False):
                 return None
             with open_transport(config, password) as transport:
                 transport.upload(staged, remote)
-    except (AuthorizationError, LocalError, TransportError) as error:
-        return f"Zed Transfer · Upload non riuscito per {_display(local.name)}. {_display(str(error))}"
+    except (AuthorizationError, ConfigError, LocalError, TransportError) as error:
+        return TransferResult(f"Upload non riuscito per {filename}. {_display(str(error))}", success=False)
     except OSError:
-        return f"Zed Transfer · Impossibile leggere o caricare {_display(local.name)}."
-    return f"Zed Transfer · Caricato {_endpoint(config, remote)}"
+        return TransferResult(f"Impossibile leggere o caricare {filename}.", success=False)
+    return TransferResult(f"Caricato {filename} su {_endpoint(config, remote)}", success=True)
 
 
-def _auto_upload(root: Path, workspace: Path, file: Path, prompted: set[str]) -> str | SavePrompt | None:
+def _auto_upload(
+    root: Path, workspace: Path, file: Path, prompted: set[str],
+) -> str | SavePrompt | TransferResult | UploadJob | None:
     try:
         if not file.is_relative_to(workspace) or workspace.resolve(strict=True) != root:
             return None
@@ -212,9 +270,9 @@ def _auto_upload(root: Path, workspace: Path, file: Path, prompted: set[str]) ->
         return None
     try:
         config = _read_auto_config(root, auth)
-    except ConfigError:
+    except ConfigError as error:
         if auth is not None:
-            return "Zed Transfer · Configurazione cambiata o non valida. Verificala con zed-transfer check."
+            return TransferResult(f"Configurazione FTP o SFTP non valida. {_display(str(error))}", success=False)
         return None
     if not config.upload_on_save or config.protocol == "ftp" or config.password is True:
         return None
@@ -223,8 +281,9 @@ def _auto_upload(root: Path, workspace: Path, file: Path, prompted: set[str]) ->
         _protect_local(config, local)
     except (ConfigError, LocalError):
         return None
+    filename = _display(local.name)
     if auth is not None and verify_authorization(auth, config):
-        return _upload_approved(config, local, remote, auth)
+        return UploadJob(filename, lambda: _upload_approved(config, local, remote, auth))
 
     uses_password = isinstance(config.password, str)
     if config.source_fingerprint in prompted or (config.protocol == "ftps" and not uses_password):
@@ -235,14 +294,14 @@ def _auto_upload(root: Path, workspace: Path, file: Path, prompted: set[str]) ->
         return None
     prompted.add(config.source_fingerprint)
 
-    def accept() -> str | None:
+    def accept() -> TransferResult | UploadJob:
         try:
             if _read_auto_config(root, auth) != config:
-                return "Zed Transfer · Configurazione cambiata. Salva di nuovo per controllare la destinazione."
+                raise LocalError("Configurazione cambiata. Salva di nuovo per controllare la destinazione.")
             approved = authorize(config, allow_config_password=uses_password, expected_status=(auth, False))
-        except (AuthorizationError, ConfigError) as error:
-            return f"Zed Transfer · {_display(str(error))}"
-        return _upload_approved(config, local, remote, approved, expected_source=saved_file)
+        except (AuthorizationError, ConfigError, LocalError) as error:
+            return TransferResult(_display(str(error)), success=False)
+        return UploadJob(filename, lambda: _upload_approved(config, local, remote, approved, expected_source=saved_file))
 
     message = _approval_message(config, uses_password=uses_password, markdown=True)
     message += f"\n\nConfermando caricherai anche il file appena salvato, {_markdown_code(local.name)}."
@@ -298,7 +357,18 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "lsp":
             prompted: set[str] = set()
-            return run_lsp(lambda workspace, file: _auto_upload(root, workspace, file, prompted))
+            return run_lsp(
+                lambda workspace, file: _auto_upload(root, workspace, file, prompted),
+                menu=lambda workspace: _preset_menu(root, workspace),
+            )
+        if args.command == "init":
+            path = create_project_config(root, args.preset)
+            print(f"Configurazione creata in {_display(path)}")
+            return 0
+        if args.command == "save-preset":
+            path = save_custom_preset(root, args.config)
+            print(f"Modello personale salvato in {_display(path)}")
+            return 0
         config = load_config(root, path=args.config, name=args.name, profile=args.profile)
         if args.command == "check":
             _check(config)
@@ -315,7 +385,7 @@ def main(argv: list[str] | None = None) -> int:
                     print(_display(line))
         else:
             _transfer(args, config)
-    except (AuthorizationError, ConfigError, LocalError, TransportError) as error:
+    except (AuthorizationError, ConfigError, LocalError, PresetError, TransportError) as error:
         print(f"Errore. {_display(str(error))}", file=sys.stderr)
         return 1
     except OSError as error:

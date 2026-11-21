@@ -2,7 +2,7 @@
 
 Carica e scarica singoli file da Zed via SFTP, FTPS esplicito o FTP. Puoi riusare il tuo `.vscode/sftp.json` e avviare i trasferimenti dal pannello **Tasks** di Zed o dal terminale.
 
-Il progetto si ispira a [zed-sftp](https://github.com/andreyc0d3r/zed-sftp) e usa i task integrati di Zed per i trasferimenti manuali. Un'estensione opzionale permette di caricare automaticamente i file al salvataggio nei progetti che autorizzi.
+Il progetto si ispira a [zed-sftp](https://github.com/andreyc0d3r/zed-sftp) e usa i task integrati di Zed per i trasferimenti manuali. L'estensione opzionale aggiunge il menu di configurazione e l'upload al salvataggio nei progetti che autorizzi.
 
 ## Installazione su macOS e Linux
 
@@ -30,9 +30,45 @@ zed-transfer check
 
 `install-zed` crea `.zed/tasks.json`. Se il file esiste già, aprilo con **Zed: Open Project Tasks** e copia i quattro oggetti dal [modello dei task](zed_transfer/templates/tasks.json) nell'array già presente, separandoli con virgole. `check` legge il profilo attivo e mostra la destinazione senza collegarsi al server.
 
+### Aggiorna dalla versione precedente
+
+Se usi già l'estensione di sviluppo, aggiorna il tool e riavvia Zed.
+
+```sh
+pipx install --force git+https://github.com/miniMAC/zed-transfer.git
+```
+
 ## Configurazione e migrazione da VS Code
 
 Mantieni `.vscode/sftp.json` nella radice del progetto. Sono supportati commenti e virgole finali. In assenza di quel file viene cercato `.zed/sftp.json`. Per usare un file diverso all'interno del progetto, puoi specificarlo con `--config`. Tieni i file di connessione fuori da Git aggiungendoli al `.gitignore` del progetto.
+
+### Crea la configurazione da Zed
+
+Dopo aver installato l'estensione, apri in Zed un file supportato, per esempio `index.php`, premi **⌘.** su macOS o **Ctrl+.** su Linux e scegli **Zed Transfer · Configurazione…**. Con l'impostazione Zed `"code_lens": "on"` puoi anche fare clic sul comando sopra la prima riga del file.
+
+- In un progetto nuovo, scegli **SFTP con chiave**, **SFTP con password**, **FTPS** oppure il tuo **modello personale**. Zed apre il nuovo `.vscode/sftp.json`. Inserisci host, utente e cartella remota, poi usa **Verifica configurazione** nei task o esegui `zed-transfer check` nel terminale.
+- In un progetto già configurato, puoi aprire il JSON esistente per modificarlo o salvarlo come modello personale per altri siti. La creazione rispetta i file `.vscode/sftp.json` e `.zed/sftp.json` già presenti.
+
+Il modello personale conserva i dati di connessione e sostituisce eventuali password in chiaro con `"password": true`. I file creati da un modello partono con `"uploadOnSave": false` e richiedono un'autorizzazione separata per ogni progetto.
+
+Dal terminale del sito, scegli uno dei comandi di creazione.
+
+```sh
+zed-transfer init sftp-key
+zed-transfer init sftp-password
+zed-transfer init ftps
+```
+
+Per creare un modello personale, esegui `save-preset` nella radice del sito sorgente. Usa `--config` se il JSON si trova in un percorso personalizzato del progetto.
+
+```sh
+zed-transfer save-preset
+zed-transfer --config configurazioni/staging.json save-preset
+```
+
+Riusa il modello con `zed-transfer init custom` nella radice del nuovo sito.
+
+### Esempio WordPress
 
 Questa configurazione mappa la cartella `wp-content` di un sito WordPress.
 
@@ -128,7 +164,7 @@ L'estensione riceve da Zed l'evento di salvataggio dei file delle lingue che sup
 
 ### Installa l'estensione una volta
 
-1. Se avevi già installato il tool con `pipx` da GitHub, aggiornalo con `pipx reinstall zed-transfer`. Se è la prima installazione, usa il comando `pipx install` qui sopra.
+1. Installa o aggiorna il tool con `pipx` usando i comandi qui sopra.
 2. Installa Rust tramite [rustup](https://rustup.rs/) e clona il sorgente con `git clone https://github.com/miniMAC/zed-transfer.git` in una cartella a tua scelta. Se hai già il clone, aggiornalo con `git pull`.
 3. In Zed, dalla palette dei comandi, esegui **`zed: install dev extension`** e seleziona la sottocartella `extension` dentro `zed-transfer`. Tieni la cartella in quella posizione finché usi l'estensione locale. Poi apri o riapri il progetto del sito.
 
@@ -144,11 +180,17 @@ L'upload automatico supporta SFTP e FTPS. Il messaggio ti indica quando verrà u
 
 Per selezionare il profilo dall'editor, usa `defaultProfile` nel JSON quando sono presenti più profili. Se il progetto usa un array di server o un file di configurazione personalizzato, puoi selezionare la connessione dal terminale.
 
+### Controlla l'esito in Zed
+
+Durante l'upload, la barra di stato in basso mostra l'attività di Zed Transfer e l'avanzamento disponibile. A trasferimento completato compare una notifica temporanea con la spunta verde. Se l'upload fallisce, Zed mostra l'icona rossa di errore e la causa rilevata.
+
+Per i dettagli, apri **`dev: open language server logs`** dalla palette e seleziona **Zed Transfer on Save**. Se il server non parte, consulta **`zed: open log`**.
+
 ### Opzioni da terminale
 
 Per autorizzare dal terminale, usa `zed-transfer enable-auto-upload` con una chiave o l'agente SSH. Se il JSON contiene la password del server usa `zed-transfer --allow-config-password enable-auto-upload`. Puoi combinare questa opzione con `--config`, `--name` e `--profile` per scegliere la connessione.
 
-Con `"password": true` il tool richiede la password durante un trasferimento manuale. Per vedere l'esito dei trasferimenti automatici, apri **`dev: open language server logs`** e seleziona **Zed Transfer on Save**. Se il server non parte, consulta **`zed: open log`**.
+Con `"password": true` il tool richiede la password durante un trasferimento manuale.
 
 Per disattivare l'upload e la richiesta di autorizzazione, imposta `"uploadOnSave": false` nel JSON o esegui `zed-transfer disable-auto-upload` dalla cartella del progetto. Dopo il comando di disattivazione, `enable-auto-upload` riattiva esplicitamente il progetto.
 

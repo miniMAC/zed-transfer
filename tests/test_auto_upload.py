@@ -5,10 +5,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from zed_transfer.cli import _auto_upload, _enable_auto_upload
+from zed_transfer.cli import _auto_upload, _enable_auto_upload, _preset_menu
 from zed_transfer.config import load_config
 from zed_transfer.local import LocalError
-from zed_transfer.lsp import SavePrompt
+from zed_transfer.lsp import MenuPrompt, SavePrompt, TransferResult, UploadJob
 
 
 class AutoUploadTest(unittest.TestCase):
@@ -50,8 +50,12 @@ class AutoUploadTest(unittest.TestCase):
             yield SimpleNamespace(upload=upload)
 
         with patch("zed_transfer.cli.open_transport", side_effect=connect):
-            result = self.save()
-        self.assertIn("Caricato", result)
+            job = self.save()
+            self.assertIsInstance(job, UploadJob)
+            self.assertEqual(calls, [])
+            result = job.run()
+        self.assertTrue(result.success)
+        self.assertIn("Caricato", result.message)
         self.assertEqual(calls, [("<?php echo 'saved';", "/wordpress/index.php")])
 
     def test_skips_revoked_changed_ignored_and_protected_files(self):
@@ -110,7 +114,10 @@ class AutoUploadTest(unittest.TestCase):
                 self.assertIsNone(self.save())
                 store.assert_not_called()
                 transport.assert_not_called()
-                self.assertIn("Caricato", prompt.accept())
+                job = prompt.accept()
+                self.assertIsInstance(job, UploadJob)
+                self.assertEqual(calls, [])
+                self.assertIn("Caricato", job.run().message)
         self.assertEqual(calls, ["/wordpress/index.php"])
 
     def test_changed_configuration_invalidates_open_prompt(self):
@@ -120,7 +127,10 @@ class AutoUploadTest(unittest.TestCase):
         original = self.source.read_text(encoding="utf-8")
         self.source.write_text(original.replace("/wordpress", "/another-site"), encoding="utf-8")
         with patch("zed_transfer.cli.authorize") as approve, patch("zed_transfer.cli.open_transport") as connect:
-            self.assertIn("Configurazione cambiata", prompt.accept())
+            result = prompt.accept()
+            self.assertIsInstance(result, TransferResult)
+            self.assertFalse(result.success)
+            self.assertIn("Configurazione cambiata", result.message)
             approve.assert_not_called()
             connect.assert_not_called()
         self.assertIn("/another-site", self.save().message)
@@ -129,8 +139,31 @@ class AutoUploadTest(unittest.TestCase):
         self.get_auth.return_value = (None, False)
         prompt = self.save()
         self.file.write_text("a later write", encoding="utf-8")
-        with patch("zed_transfer.cli.authorize", return_value=self.auth) as approve:
+        with patch("zed_transfer.cli.authorize", side_effect=lambda *args, **kwargs: self.auth) as approve:
             with patch("zed_transfer.cli.open_transport") as connect:
-                self.assertIn("Il file è cambiato", prompt.accept())
+                job = prompt.accept()
+                self.get_auth.return_value = (self.auth, False)
+                result = job.run()
+                self.assertFalse(result.success)
+                self.assertIn("Il file è cambiato", result.message)
                 approve.assert_called_once()
                 connect.assert_not_called()
+
+    def test_config_menu_existing_project_can_open_and_save_a_preset(self):
+        menu = _preset_menu(self.root, self.root)
+        self.assertIsInstance(menu, MenuPrompt)
+        self.assertEqual(menu.actions, ("Apri sftp.json", "Salva come modello personale"))
+        self.assertEqual(menu.select("Apri sftp.json").open_path, self.source)
+        with patch("zed_transfer.cli.save_custom_preset") as save:
+            result = menu.select("Salva come modello personale")
+        self.assertIn("Modello personale salvato", result.message)
+        save.assert_called_once_with(self.root)
+
+    def test_config_menu_creates_template_only_after_choice(self):
+        self.source.unlink()
+        menu = _preset_menu(self.root, self.root)
+        self.assertIn("Crea JSON · FTPS", menu.actions)
+        self.assertFalse(self.source.exists())
+        config = menu.select("Crea JSON · FTPS")
+        self.assertEqual(config.open_path, self.source)
+        self.assertFalse(load_config(self.root).upload_on_save)

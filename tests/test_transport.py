@@ -8,7 +8,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from zed_transfer.transport import _FTP, _FTPSClient, _SFTP, _askpass, TransportError, open_transport
+from zed_transfer.transport import (
+    _FTP, _FTPSClient, _SFTP, _askpass, _ftp_errors, _sftp_error, TransportError, open_transport,
+)
 
 
 class TransportTest(unittest.TestCase):
@@ -45,8 +47,9 @@ class TransportTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "source"
             source.write_bytes(b"fixture")
-            with self.assertRaises(TransportError):
+            with self.assertRaisesRegex(TransportError, "rinomina finale") as caught:
                 _FTP(client, "/staging").upload(source, "/public/target")
+        self.assertEqual(caught.exception.code, 550)
         stage, target = client.rename.call_args.args
         self.assertTrue(stage.startswith("/staging/.zed-transfer-"))
         self.assertEqual(target, "/public/target")
@@ -69,3 +72,34 @@ class TransportTest(unittest.TestCase):
             data_socket, server_hostname="example.test", session=client.sock.session,
         )
         self.assertEqual((wrapped, size), (context.wrap_socket.return_value, 10))
+
+    def test_sftp_reports_actionable_errors_without_remote_diagnostics(self):
+        secret_path = b'"/private/untrusted\x1b[31m-fixture"'
+        for diagnostic, expected in (
+            (b"dest open " + secret_path + b": No such file or directory", "cartella per l'upload"),
+            (b"dest open " + secret_path + b": Permission denied", "Permesso negato"),
+            (b"remote rename " + secret_path + b' to "/remote/target": Failure', "rinomina finale"),
+            (b"write remote " + secret_path + b": Disk quota exceeded", "quota esauriti"),
+            (b"deploy@example.test: Permission denied (publickey,password).", "Autenticazione SFTP"),
+            (b"ssh: connect to host example.test port 22: Connection timed out", "Connessione SFTP scaduta"),
+        ):
+            with self.subTest(expected=expected):
+                error = _sftp_error(1, diagnostic)
+                self.assertIn(expected, str(error))
+                self.assertNotIn("untrusted", str(error))
+                self.assertEqual(error.code, 1)
+
+    def test_ftp_status_codes_and_tls_errors_do_not_include_raw_messages(self):
+        for exception, expected, code in (
+            (ftplib.error_perm("530 opaque-credential"), "Autenticazione", 530),
+            (ftplib.error_temp("425-opaque-credential"), "canale dati", 425),
+            (ftplib.error_perm("552 opaque-credential"), "Quota", 552),
+            (TimeoutError("opaque-credential"), "scaduta", None),
+            (ssl.SSLCertVerificationError("opaque-credential"), "certificato", None),
+        ):
+            with self.subTest(expected=expected):
+                with self.assertRaisesRegex(TransportError, expected) as caught:
+                    with _ftp_errors("upload"):
+                        raise exception
+                self.assertNotIn("opaque-credential", str(caught.exception))
+                self.assertEqual(caught.exception.code, code)

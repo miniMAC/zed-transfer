@@ -60,16 +60,16 @@ def _assert_directory(fd: int, *, private: bool) -> None:
 
 
 @contextmanager
-def _state_directory(root: Path, *, create: bool = False):
+def _state_directory(root: Path, *, create: bool = False, location: tuple[str, ...] = _STATE):
     home = _account_home()
-    if home.joinpath(*_STATE).is_relative_to(root):
+    if home.joinpath(*location).is_relative_to(root):
         raise AuthorizationError("La directory delle autorizzazioni deve essere fuori dal progetto.")
     with ExitStack() as cleanup:
         try:
             current = os.open(home, _DIR_FLAGS)
             cleanup.callback(os.close, current)
             _assert_directory(current, private=False)
-            for index, part in enumerate(_STATE):
+            for index, part in enumerate(location):
                 if create:
                     with suppress(FileExistsError):
                         os.mkdir(part, 0o700, dir_fd=current)

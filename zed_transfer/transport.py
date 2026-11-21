@@ -7,6 +7,7 @@ import ftplib
 import math
 import os
 import posixpath
+import re
 import shutil
 import signal
 import socket
@@ -27,6 +28,46 @@ if TYPE_CHECKING:
 
 class TransportError(Exception):
     """A transport failure safe to report without printing server responses."""
+
+    def __init__(self, message: str, *, code: int | None = None):
+        super().__init__(message)
+        self.code = code
+
+
+def _sftp_error(status: int, stderr: bytes) -> TransportError:
+    diagnostics = stderr.lower()
+    lines = diagnostics.splitlines()
+    missing = any(line.endswith((b": no such file or directory", b" not found.")) for line in lines)
+    if b"host key verification failed" in diagnostics or b"host identification has changed" in diagnostics:
+        message = "Verifica della chiave SSH fallita. Controlla l'impronta del server in known_hosts."
+    elif re.search(rb"permission denied \([a-z0-9@.,_-]+\)\.?\r?$", diagnostics, re.MULTILINE):
+        message = "Autenticazione SFTP fallita. Controlla utente e credenziali SSH."
+    elif any(line.endswith((b"no space left on device", b"no space on filesystem", b"quota exceeded")) for line in lines):
+        message = "Spazio o quota esauriti sul server SFTP. Libera spazio o verifica la quota dell'account."
+    elif any(line.startswith(b"remote rename ") for line in lines):
+        if missing:
+            message = "La cartella di destinazione SFTP è assente. Verifica remotePath e le sottocartelle."
+        else:
+            message = ("Il server SFTP ha rifiutato la rinomina finale. Verifica i permessi sulla destinazione "
+                       "e che remoteTempPath sia sullo stesso filesystem.")
+    elif missing and any(line.startswith(b"dest open ") for line in lines):
+        message = ("La cartella per l'upload SFTP è assente. Verifica remotePath, le sottocartelle "
+                   "e remoteTempPath se impostata.")
+    elif missing:
+        message = "Il percorso remoto SFTP è assente. Verifica remotePath e il nome del file."
+    elif any(line.endswith(b": permission denied") for line in lines):
+        message = "Permesso negato sul server SFTP. Verifica i permessi dell'account sulla cartella remota."
+    elif b"could not resolve hostname" in diagnostics:
+        message = "Nome del server SFTP non risolto. Verifica host e DNS."
+    elif b"timed out" in diagnostics:
+        message = "Connessione SFTP scaduta. Verifica host, porta e raggiungibilità del server."
+    elif any(reason in diagnostics for reason in (b"connection refused", b"no route to host", b"network is unreachable")):
+        message = "Connessione SFTP fallita. Controlla host, porta e firewall."
+    elif any(reason in diagnostics for reason in (b"connection closed", b"connection reset", b"broken pipe")):
+        message = "Connessione SFTP interrotta. Verifica la rete e che il servizio SFTP sia attivo."
+    else:
+        message = "Operazione SFTP fallita. Controlla il percorso remoto, i permessi e i log del server."
+    return TransportError(message, code=status)
 
 
 def _staging_path(remote: str, directory: str | None) -> str:
@@ -151,14 +192,7 @@ class _SFTP:
             raise TransportError("Impossibile avviare OpenSSH o la procedura locale per la password.") from None
 
         if status:
-            errors = stderr.lower()
-            if b"host key verification failed" in errors or b"host identification has changed" in errors:
-                raise TransportError("Verifica della chiave SSH fallita. Controlla l'impronta del server in known_hosts.")
-            if b"permission denied (" in errors:
-                raise TransportError("Autenticazione SFTP fallita. Controlla utente e credenziali SSH.")
-            if b"connection refused" in errors or b"connection timed out" in errors:
-                raise TransportError("Connessione SFTP fallita. Controlla host e porta.")
-            raise TransportError("Operazione SFTP fallita. Controlla il percorso remoto, i permessi e i log del server.")
+            raise _sftp_error(status, stderr)
         return stdout.decode("utf-8", errors="replace")
 
     def list(self, remote: str) -> list[str]:
@@ -183,18 +217,73 @@ class _SFTP:
         self._run(f"get {_quote_sftp_path(remote)} {_quote_sftp_path(local)}")
 
 
+_FTP_REASONS = {
+    421: "Servizio FTP/FTPS non disponibile. Verifica lo stato del server o riprova più tardi.",
+    425: "Il server FTP/FTPS non ha aperto il canale dati. Verifica firewall e porte passive.",
+    426: "Il trasferimento FTP/FTPS si è interrotto. Verifica la rete e riprova.",
+    430: "Autenticazione FTP/FTPS rifiutata. Verifica utente e password.",
+    451: "Il server FTP/FTPS ha interrotto l'operazione per un errore interno. Controlla i log del server.",
+    452: "Spazio insufficiente sul server FTP/FTPS. Verifica la quota dell'account.",
+    530: "Autenticazione FTP/FTPS rifiutata. Verifica utente e password.",
+    532: "L'account FTP/FTPS non è autorizzato a scrivere. Verifica i permessi sul server.",
+    534: "Il server FTP/FTPS ha rifiutato il metodo di autenticazione. Verifica protocollo e porta.",
+    536: "Il server FTPS non consente la protezione richiesta per il canale dati.",
+    550: "File o cartella FTP/FTPS non accessibili. Verifica percorso e permessi dell'account.",
+    552: "Quota o spazio esauriti sul server FTP/FTPS. Libera spazio o verifica la quota dell'account.",
+    553: "Il server FTP/FTPS ha rifiutato il nome del file. Verifica nome e permessi della cartella.",
+}
+_FTP_CODE = re.compile(r"([1-5][0-9]{2})(?=[ \t\r\n-]|$)")
+
+
+def _ftp_reply_error(error: ftplib.Error, operation: str) -> TransportError:
+    reply = str(error)
+    match = _FTP_CODE.match(reply)
+    code = int(match[1]) if match else None
+    if operation == "rename" and code in {450, 550, 553}:
+        message = ("Il server FTP/FTPS ha rifiutato la rinomina finale. Verifica i permessi sulla destinazione "
+                   "e che remoteTempPath sia sullo stesso filesystem.")
+    elif code == 550:
+        reason = reply[3:].lower()
+        if "quota exceeded" in reason or "no space left" in reason:
+            message = _FTP_REASONS[552]
+        elif "permission denied" in reason or "access denied" in reason:
+            message = "Permesso negato sul server FTP/FTPS. Verifica i permessi dell'account sulla cartella remota."
+        elif "no such file or directory" in reason and operation == "upload":
+            message = ("La cartella per l'upload FTP/FTPS è assente. Verifica remotePath, le sottocartelle "
+                       "e remoteTempPath se impostata.")
+        else:
+            message = _FTP_REASONS[550]
+    elif operation == "ftps_login" and code in {500, 502, 504}:
+        message = "Il server non ha accettato FTPS esplicito. Verifica protocollo e porta."
+    elif operation == "ftps_protection" and code not in _FTP_REASONS:
+        message = "Il server non ha attivato la protezione FTPS del canale dati. Verifica la configurazione TLS."
+    else:
+        message = _FTP_REASONS.get(code, "Operazione FTP/FTPS fallita. Verifica connessione, percorso remoto e log del server.")
+    if code is not None:
+        message += f" (codice FTP {code})"
+    return TransportError(message, code=code)
+
+
 @contextmanager
-def _ftp_errors():
+def _ftp_errors(operation: str):
     try:
         yield
     except ssl.SSLCertVerificationError:
-        raise TransportError("Verifica del certificato FTPS fallita. Controlla il certificato e il nome host.") from None
+        raise TransportError("Verifica del certificato FTPS fallita. Controlla nome host, scadenza e catena del certificato.") from None
     except ssl.SSLError:
-        raise TransportError("Handshake FTPS fallito. Controlla la configurazione TLS del server.") from None
-    except ftplib.all_errors as error:
-        status = str(error).split(" ", 1)[0]
-        status = f" (codice FTP {status})" if len(status) == 3 and status.isascii() and status.isdigit() else ""
-        raise TransportError(f"Operazione FTP fallita{status}. Controlla connessione, credenziali e percorso remoto.") from None
+        raise TransportError("Connessione TLS FTPS fallita. Controlla protocollo, porta e configurazione TLS del server.") from None
+    except TimeoutError:
+        raise TransportError("Connessione FTP/FTPS scaduta. Verifica rete, host e porta.") from None
+    except socket.gaierror:
+        raise TransportError("Nome del server FTP/FTPS non risolto. Verifica host e DNS.") from None
+    except ConnectionRefusedError:
+        raise TransportError("Connessione FTP/FTPS rifiutata. Verifica host, porta e firewall.") from None
+    except (ConnectionError, EOFError):
+        raise TransportError("Connessione FTP/FTPS interrotta. Verifica la rete e che il servizio sia attivo.") from None
+    except ftplib.Error as error:
+        raise _ftp_reply_error(error, operation) from None
+    except OSError:
+        raise TransportError("Operazione FTP/FTPS non riuscita per un errore di I/O. Verifica rete e file locale.") from None
 
 
 class _FTPSClient(ftplib.FTP_TLS):
@@ -219,7 +308,7 @@ class _FTP:
 
     def list(self, remote: str) -> list[str]:
         remote = validate_remote_path(remote)
-        with _ftp_errors():
+        with _ftp_errors("list"):
             self._client.cwd(remote)
             try:
                 entries = self._client.mlsd()
@@ -232,18 +321,20 @@ class _FTP:
     def upload(self, local: Path, remote: str) -> None:
         remote = validate_remote_path(remote)
         staging = _staging_path(remote, self._remote_temp_path)
-        with _ftp_errors(), local.open("rb") as source:
+        with local.open("rb") as source:
             try:
-                self._client.storbinary(f"STOR {staging}", source, blocksize=65536)
-                self._client.rename(staging, remote)
-            except ftplib.all_errors:
+                with _ftp_errors("upload"):
+                    self._client.storbinary(f"STOR {staging}", source, blocksize=65536)
+                with _ftp_errors("rename"):
+                    self._client.rename(staging, remote)
+            except TransportError:
                 with suppress(*ftplib.all_errors):
                     self._client.delete(staging)
                 raise
 
     def download(self, remote: str, local: Path) -> None:
         remote = validate_remote_path(remote)
-        with _ftp_errors(), local.open("wb") as target:
+        with local.open("wb") as target, _ftp_errors("download"):
             self._client.retrbinary(f"RETR {remote}", target.write, blocksize=65536)
 
 
@@ -264,12 +355,14 @@ def open_transport(config: Config, password: str | None = None, *, allow_insecur
         raise TransportError("Protocollo di trasferimento non supportato.")
 
     try:
-        with _ftp_errors():
-            # Keep passive data connections on the authenticated control peer.
-            client.trust_server_pasv_ipv4_address = False
+        # Keep passive data connections on the authenticated control peer.
+        client.trust_server_pasv_ipv4_address = False
+        with _ftp_errors("connect"):
             client.connect(config.host, config.port, timeout=config.timeout)
+        with _ftp_errors("ftps_login" if config.protocol == "ftps" else "login"):
             client.login(config.username, password or "")
-            if isinstance(client, ftplib.FTP_TLS):
+        if isinstance(client, ftplib.FTP_TLS):
+            with _ftp_errors("ftps_protection"):
                 client.prot_p()
         yield _FTP(client, config.remote_temp_path)
     finally:
