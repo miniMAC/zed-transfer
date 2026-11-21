@@ -1,5 +1,11 @@
 [
   {
+    "label": "Crea JSON Zed Transfer",
+    "command": "zed-transfer",
+    "args": ["init"],
+    "cwd": "$ZED_WORKTREE_ROOT"
+  },
+  {
     "label": "Zed Transfer · Verifica configurazione",
     "command": "zed-transfer",
     "args": ["check"]

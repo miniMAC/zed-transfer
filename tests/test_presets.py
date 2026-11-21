@@ -2,9 +2,12 @@ import json
 import os
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
+from zed_transfer.cli import main
 from zed_transfer.config import ConfigError, load_config
 from zed_transfer.presets import PresetError, create_project_config, project_config_path, save_custom_preset
 
@@ -40,6 +43,31 @@ class PresetTest(unittest.TestCase):
                 self.assertEqual(config.host, "example.invalid")
                 self.assertEqual(config.password, password)
                 self.assertFalse(config.upload_on_save)
+
+    def test_interactive_task_creates_selected_config_in_empty_project(self):
+        with redirect_stdout(StringIO()) as output:
+            self.assertEqual(main(["--root", str(self.root), "install-zed"]), 0)
+            tasks = json.loads((self.root / ".zed" / "tasks.json").read_text(encoding="utf-8"))
+            task = next(item for item in tasks if item["label"] == "Crea JSON Zed Transfer")
+            self.assertEqual(task["cwd"], "$ZED_WORKTREE_ROOT")
+            with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value="3"):
+                self.assertEqual(main(["--root", str(self.root), *task["args"]]), 0)
+        self.assertIn(str(self.root), output.getvalue())
+        self.assertEqual(load_config(self.root).protocol, "ftps")
+
+    def test_interactive_task_cancel_and_existing_config_are_safe(self):
+        args = ["--root", str(self.root), "init"]
+        with redirect_stdout(StringIO()), patch("sys.stdin.isatty", return_value=True):
+            with patch("builtins.input", return_value="0"):
+                self.assertEqual(main(args), 0)
+        self.assertIsNone(project_config_path(self.root))
+        path = create_project_config(self.root, "ftps")
+        original = path.read_bytes()
+        with redirect_stderr(StringIO()) as error, patch("builtins.input") as prompt:
+            self.assertEqual(main(args), 1)
+        prompt.assert_not_called()
+        self.assertEqual(path.read_bytes(), original)
+        self.assertIn("Configurazione già presente", error.getvalue())
 
     def test_does_not_replace_or_shadow_project_configuration(self):
         original = create_project_config(self.root, "sftp-key")

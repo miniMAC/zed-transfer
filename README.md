@@ -28,11 +28,11 @@ zed-transfer install-zed
 zed-transfer check
 ```
 
-`install-zed` crea `.zed/tasks.json`. Se il file esiste già, aprilo con **Zed: Open Project Tasks** e copia i quattro oggetti dal [modello dei task](zed_transfer/templates/tasks.json) nell'array già presente, separandoli con virgole. `check` legge il profilo attivo e mostra la destinazione senza collegarsi al server.
+`install-zed` crea `.zed/tasks.json`. Se il file esiste già, aprilo con **Zed: Open Project Tasks** e copia i task che ti servono dal [modello dei task](zed_transfer/templates/tasks.json) nell'array già presente, separandoli con virgole. `check` legge il profilo attivo e mostra la destinazione senza collegarsi al server.
 
 ### Aggiorna dalla versione precedente
 
-Se usi già l'estensione di sviluppo, aggiorna il tool e riavvia Zed.
+Se hai già installato Zed Transfer, aggiorna il tool e riavvia Zed. Dalla versione 0.3.1 puoi usare il menu di creazione anche nei progetti vuoti.
 
 ```sh
 pipx install --force git+https://github.com/miniMAC/zed-transfer.git
@@ -41,6 +41,35 @@ pipx install --force git+https://github.com/miniMAC/zed-transfer.git
 ## Configurazione e migrazione da VS Code
 
 Mantieni `.vscode/sftp.json` nella radice del progetto. Sono supportati commenti e virgole finali. In assenza di quel file viene cercato `.zed/sftp.json`. Per usare un file diverso all'interno del progetto, puoi specificarlo con `--config`. Tieni i file di connessione fuori da Git aggiungendoli al `.gitignore` del progetto.
+
+### Crea il JSON anche in un progetto vuoto
+
+Apri **`zed: open tasks`** dalla palette di Zed e aggiungi questo oggetto una sola volta all'array dei task globali. Se parti da un file vuoto, racchiudi l'oggetto tra `[` e `]`.
+
+```json
+{
+  "label": "Crea JSON Zed Transfer",
+  "command": "zed-transfer",
+  "args": ["init"],
+  "cwd": "$ZED_WORKTREE_ROOT",
+  "tags": ["zed-transfer-global-init"]
+}
+```
+
+Apri la cartella del sito come progetto in Zed. Dal pannello **Project Panel** premi **⌘⇧R** su macOS o **Ctrl+Shift+R** su Linux e scegli **Crea JSON Zed Transfer**. Il terminale di Zed mostra la cartella di destinazione e il menu numerato per SFTP con chiave, SFTP con password, FTPS o il modello personale. Puoi aprire `.vscode/sftp.json` dopo la creazione.
+
+Su macOS puoi aggiungere la scorciatoia **⌥⌘⇧S** al pannello con **`zed: open keymap`**. Aggiungi questo oggetto all'array delle scorciatoie.
+
+```json
+{
+  "context": "ProjectPanel && not_editing",
+  "bindings": {
+    "alt-cmd-shift-s": ["task::Spawn", { "task_tag": "zed-transfer-global-init" }]
+  }
+}
+```
+
+Il task usa la radice del progetto. Per configurare un altro sito, apri la sua cartella come progetto. Puoi aprire lo stesso menu con **Open in Terminal** dal menu contestuale della radice del sito, poi digitando `zed-transfer init`.
 
 ### Crea la configurazione da Zed
 

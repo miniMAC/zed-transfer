@@ -24,6 +24,14 @@ from .presets import PresetError, create_project_config, project_config_path, sa
 from .transport import TransportError, open_transport
 
 
+_PRESET_LABELS = {
+    "sftp-key": "SFTP con chiave",
+    "sftp-password": "SFTP con password",
+    "ftps": "FTPS",
+    "custom": "Modello personale",
+}
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="zed-transfer", description="Trasferimenti SFTP e FTP per Zed.")
     parser.add_argument("--root", type=Path, help="Directory del progetto, predefinita alla directory corrente")
@@ -42,7 +50,7 @@ def _parser() -> argparse.ArgumentParser:
     commands.add_parser("disable-auto-upload", help="Revoca l'autorizzazione per il progetto")
     commands.add_parser("lsp", help="Avvia il server locale usato dall'estensione Zed")
     init = commands.add_parser("init", help="Crea .vscode/sftp.json da un modello")
-    init.add_argument("preset", choices=("sftp-key", "sftp-password", "ftps", "custom"))
+    init.add_argument("preset", nargs="?", choices=tuple(_PRESET_LABELS), help="Ometti per scegliere il modello")
     commands.add_parser("save-preset", help="Salva la configurazione come modello personale senza credenziali")
     for command, description in (("upload", "Carica un file"), ("download", "Scarica un file")):
         transfer = commands.add_parser(command, help=description)
@@ -125,6 +133,27 @@ def _install_zed(root: Path) -> None:
     print("Task installati in .zed/tasks.json. Apri la palette di Zed e cerca task: spawn.")
 
 
+def _choose_preset(root: Path) -> str | None:
+    existing = project_config_path(root)
+    if existing is not None:
+        raise LocalError(f"Configurazione già presente. Apri {_display(existing)} per modificarla.")
+    if not sys.stdin.isatty():
+        raise LocalError("Scegli il modello in un terminale interattivo o passalo come argomento a init.")
+
+    print(f"Crea JSON Zed Transfer\nProgetto {_display(root)}\n")
+    choices = {}
+    for index, (preset, label) in enumerate(_PRESET_LABELS.items(), start=1):
+        choices[str(index)] = preset
+        print(f"{index}. {label}")
+    print("0. Annulla")
+    answer = input("Scegli il modello [0–4] ").strip()
+    if answer in {"", "0"}:
+        return None
+    if answer not in choices:
+        raise LocalError("Scelta non valida. Usa un numero da 0 a 4.")
+    return choices[answer]
+
+
 def _preset_menu(root: Path, workspace: Path) -> MenuPrompt | MenuResult | None:
     try:
         if workspace.resolve(strict=True) != root:
@@ -133,12 +162,8 @@ def _preset_menu(root: Path, workspace: Path) -> MenuPrompt | MenuResult | None:
     except (OSError, RuntimeError, PresetError) as error:
         return MenuResult(f"Impossibile aprire la configurazione locale. {_display(str(error))}")
 
-    templates = {
-        "Crea JSON · SFTP con chiave": "sftp-key",
-        "Crea JSON · SFTP con password": "sftp-password",
-        "Crea JSON · FTPS": "ftps",
-        "Crea JSON dal modello personale": "custom",
-    }
+    templates = {f"Crea JSON · {label}": preset for preset, label in _PRESET_LABELS.items() if preset != "custom"}
+    templates["Crea JSON dal modello personale"] = "custom"
     open_json = "Apri sftp.json"
     save_preset = "Salva come modello personale"
     if existing is None:
@@ -362,7 +387,10 @@ def main(argv: list[str] | None = None) -> int:
                 menu=lambda workspace: _preset_menu(root, workspace),
             )
         if args.command == "init":
-            path = create_project_config(root, args.preset)
+            preset = args.preset or _choose_preset(root)
+            if preset is None:
+                return 0
+            path = create_project_config(root, preset)
             print(f"Configurazione creata in {_display(path)}")
             return 0
         if args.command == "save-preset":
