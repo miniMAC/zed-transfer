@@ -47,12 +47,16 @@ def project_parent(
         os.close(directory)
 
 
-def snapshot_upload(directory: int, name: str, destination: Path) -> None:
+def snapshot_upload(
+    directory: int, name: str, destination: Path, *, expected_source: os.stat_result | None = None,
+) -> None:
     fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
     with os.fdopen(fd, "rb") as source:
         original = os.fstat(source.fileno())
         if not stat.S_ISREG(original.st_mode) or original.st_nlink != 1:
             raise LocalError("Il file da caricare deve essere regolare e privo di hard link.")
+        if expected_source is not None and _identity(original) != _identity(expected_source):
+            raise LocalError("Il file è cambiato durante la conferma. Salvalo di nuovo per caricarlo.")
         with destination.open("xb") as staged:
             shutil.copyfileobj(source, staged)
             os.fchmod(staged.fileno(), stat.S_IMODE(original.st_mode) & 0o755)

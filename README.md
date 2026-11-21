@@ -134,25 +134,23 @@ L'estensione riceve da Zed l'evento di salvataggio dei file delle lingue che sup
 
 Zed deve riconoscere la lingua del file. Per PHP verifica che l'estensione **PHP** sia installata e che nell'angolo in basso a destra compaia **PHP** quando apri `index.php`. Se hai personalizzato `language_servers` per la lingua con una lista esplicita, aggiungi `transfer-on-save-lsp` alla lista esistente.
 
-### Autorizza il sito
+### Autorizza il sito in Zed
 
-Nel `.vscode/sftp.json` del progetto imposta `"uploadOnSave": true`. Dal terminale integrato di Zed, nella cartella del sito, esegui:
+1. Nel `.vscode/sftp.json` del sito imposta `"uploadOnSave": true`.
+2. Apri il sito come progetto in Zed e salva un file incluso nella configurazione.
+3. Nel messaggio di Zed controlla server e directory remota e scegli **Attiva upload automatico**. Il tool carica il file appena salvato e ricorda la scelta per i salvataggi successivi del sito.
 
-```sh
-zed-transfer enable-auto-upload
-```
+L'upload automatico supporta SFTP e FTPS. Il messaggio ti indica quando verrà usata la password già contenuta nel JSON. Per SFTP puoi anche usare una chiave o l'agente SSH. L'autorizzazione resta sul computer e vale per quella configurazione. Se modifichi il JSON, Zed ti chiede di controllare e confermare di nuovo la destinazione. Se chiudi o annulli il messaggio, puoi riaprire il progetto per rivederlo al salvataggio successivo.
 
-Controlla l'indirizzo e la directory remota prima di confermare. Da quel momento, salvando in Zed un file incluso in `context` e non escluso da `ignore`, il tool può sostituire quel file sul server. L'autorizzazione è locale a questo Mac e a questo profilo. Se modifichi il JSON approvato, conferma nuovamente con lo stesso comando. Verifica con `zed-transfer check`, usando gli stessi flag di selezione se hai più profili o server.
+Per selezionare il profilo dall'editor, usa `defaultProfile` nel JSON quando sono presenti più profili. Se il progetto usa un array di server o un file di configurazione personalizzato, puoi selezionare la connessione dal terminale.
 
-L'upload automatico supporta SFTP e FTPS. Per SFTP con chiave o agente SSH usa il comando precedente. Se il JSON contiene già la password di un server SFTP o FTPS, puoi autorizzarne l'uso con:
+### Opzioni da terminale
 
-```sh
-zed-transfer --allow-config-password enable-auto-upload
-```
+Per autorizzare dal terminale, usa `zed-transfer enable-auto-upload` con una chiave o l'agente SSH. Se il JSON contiene la password del server usa `zed-transfer --allow-config-password enable-auto-upload`. Puoi combinare questa opzione con `--config`, `--name` e `--profile` per scegliere la connessione.
 
-L'upload automatico richiede credenziali disponibili senza prompt. Con `"password": true` puoi continuare a usare i task manuali. Per vedere l'esito dei trasferimenti, apri **`dev: open language server logs`** e seleziona **Zed Transfer on Save**. Se il server non parte, consulta **`zed: open log`**.
+Con `"password": true` il tool richiede la password durante un trasferimento manuale. Per vedere l'esito dei trasferimenti automatici, apri **`dev: open language server logs`** e seleziona **Zed Transfer on Save**. Se il server non parte, consulta **`zed: open log`**.
 
-Per disattivare l'upload al salvataggio esegui `zed-transfer disable-auto-upload` dalla cartella del progetto.
+Per disattivare l'upload e la richiesta di autorizzazione, imposta `"uploadOnSave": false` nel JSON o esegui `zed-transfer disable-auto-upload` dalla cartella del progetto. Dopo il comando di disattivazione, `enable-auto-upload` riattiva esplicitamente il progetto.
 
 ## Come vengono protetti i trasferimenti
 

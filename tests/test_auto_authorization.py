@@ -1,13 +1,16 @@
 import json
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
 from unittest.mock import patch
 
 from zed_transfer.auto_authorization import (
     AuthorizationError,
     authorize,
     get_authorization,
+    get_auto_upload_status,
     revoke,
     verify_authorization,
 )
@@ -67,6 +70,7 @@ class AutoAuthorizationTest(unittest.TestCase):
         self.assertFalse(verify_authorization(approval, changed))
         self.assertTrue(revoke(self.root))
         self.assertIsNone(get_authorization(self.root))
+        self.assertEqual(get_auto_upload_status(self.root), (None, True))
         self.assertFalse(revoke(self.root))
 
     def test_replacing_project_directory_rejects_previous_approval(self):
@@ -97,7 +101,8 @@ class AutoAuthorizationTest(unittest.TestCase):
         path.symlink_to(shadow)
         with self.assertRaises(AuthorizationError):
             get_authorization(self.root)
-        self.assertTrue(revoke(self.root))
+        self.assertFalse(revoke(self.root))
+        self.assertEqual(get_auto_upload_status(self.root), (None, True))
         self.assertEqual(shadow.read_bytes(), original)
 
     def test_group_readable_state_is_rejected(self):
@@ -118,6 +123,47 @@ class AutoAuthorizationTest(unittest.TestCase):
     def test_state_location_must_be_outside_workspace(self):
         with self.assertRaisesRegex(AuthorizationError, "fuori dal progetto"):
             get_authorization(self.home)
+
+    def test_disable_even_without_approval_bypasses_pending_prompt_until_explicit_enable(self):
+        config = load_config(self.root)
+        pending = get_auto_upload_status(self.root)
+        self.assertEqual(pending, (None, False))
+        self.assertFalse(revoke(self.root))
+        self.assertEqual(get_auto_upload_status(self.root), (None, True))
+        with self.assertRaisesRegex(AuthorizationError, "già cambiato"):
+            authorize(config, allow_config_password=False, expected_status=pending)
+        self.assertEqual(get_auto_upload_status(self.root), (None, True))
+        active = authorize(config, allow_config_password=False)
+        self.assertEqual(get_auto_upload_status(self.root), (active, False))
+
+    def test_refresh_of_stale_approval_respects_new_status(self):
+        initial = authorize(load_config(self.root), allow_config_password=False)
+        expected = get_auto_upload_status(self.root)
+        self.assertEqual(expected, (initial, False))
+        self.source.write_text(json.dumps(self.fixture | {"port": 2222}), encoding="utf-8")
+        updated = load_config(self.root)
+        active = authorize(updated, allow_config_password=False, expected_status=expected)
+        self.assertTrue(verify_authorization(active, updated))
+        with self.assertRaisesRegex(AuthorizationError, "già cambiato"):
+            revoke(self.root, expected_status=expected)
+        self.assertEqual(get_auto_upload_status(self.root), (active, False))
+
+    def test_only_one_concurrent_answer_can_publish_against_same_status(self):
+        config = load_config(self.root)
+        expected = get_auto_upload_status(self.root)
+        barrier = Barrier(2)
+
+        def approve(use_password: bool) -> bool:
+            barrier.wait(timeout=5)
+            try:
+                authorize(config, allow_config_password=use_password, expected_status=expected)
+            except AuthorizationError:
+                return False
+            return True
+
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            self.assertEqual(sorted(workers.map(approve, (True, False))), [False, True])
+        self.assertIsNotNone(get_authorization(self.root))
 
 
 if __name__ == "__main__":

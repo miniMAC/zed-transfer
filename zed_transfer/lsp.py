@@ -4,7 +4,9 @@ import json
 import re
 import sys
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
+from secrets import token_hex
 from typing import BinaryIO
 from urllib.parse import unquote_to_bytes, urlsplit
 
@@ -14,6 +16,16 @@ _MAX_HEADERS = 8192
 _MAX_BODY = 1024 * 1024
 _MAX_FRAME = 64 * 1024 * 1024
 _SAVE_CAPABILITIES = {"textDocumentSync": {"openClose": False, "change": 0, "save": {"includeText": False}}}
+_ACCEPT_UPLOAD = "Attiva upload automatico"
+_CANCEL_UPLOAD = "Annulla"
+
+
+@dataclass(frozen=True)
+class SavePrompt:
+    """Request project consent before running the supplied action."""
+
+    message: str
+    accept: Callable[[], str | None]
 
 
 class _InvalidFrame(ValueError):
@@ -78,6 +90,31 @@ def _error(stream: BinaryIO, request_id: object, code: int, message: str) -> Non
     _send(stream, id=request_id, error={"code": code, "message": message})
 
 
+def _log(stream: BinaryIO, message: str, *, severity: int = 3) -> None:
+    _send(stream, method="window/logMessage", params={"type": severity, "message": message})
+
+
+def _save_failed(stream: BinaryIO) -> int:
+    _log(stream, "Zed Transfer. Errore durante il caricamento automatico.", severity=1)
+    return 1
+
+
+def _prompt_answer(message: dict[str, object]) -> bool | None:
+    if ("result" in message) == ("error" in message):
+        return None
+    if "error" in message:
+        error = message["error"]
+        if isinstance(error, dict) and type(error.get("code")) is int and isinstance(error.get("message"), str):
+            return False
+        return None
+    result = message["result"]
+    if result is None or result == {"title": _CANCEL_UPLOAD}:
+        return False
+    if result == {"title": _ACCEPT_UPLOAD}:
+        return True
+    return None
+
+
 def _file_uri(uri: object) -> Path | None:
     if (not isinstance(uri, str) or not uri.lower().startswith("file://") or has_controls(uri)
             or "?" in uri or "#" in uri or re.search(r"%(?![0-9a-fA-F]{2})", uri)):
@@ -119,11 +156,12 @@ def _save_path(params: object, root: Path) -> Path | None:
 
 
 def _session(
-    source: BinaryIO, sink: BinaryIO, on_save: Callable[[Path, Path], str | None],
+    source: BinaryIO, sink: BinaryIO, on_save: Callable[[Path, Path], str | SavePrompt | None],
 ) -> int:
     root = None
     ready = False
     shutdown = False
+    pending: tuple[str, SavePrompt] | None = None
     while (payload := _frame(source)) is not None:
         if not payload:
             continue
@@ -138,8 +176,25 @@ def _session(
         if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
             _error(sink, None, -32600, "Invalid request")
             continue
-        is_request = "id" in message
         request_id = message.get("id")
+        if "method" not in message:
+            if pending is None or request_id != pending[0]:
+                continue
+            answer = _prompt_answer(message)
+            if answer is None:
+                continue
+            _, prompt = pending
+            pending = None
+            if answer:
+                try:
+                    notice = prompt.accept()
+                except Exception:
+                    return _save_failed(sink)
+                if notice:
+                    _log(sink, notice)
+            continue
+
+        is_request = "id" in message
         method = message.get("method")
         if (request_id is not None and type(request_id) not in {int, str}) or not isinstance(method, str):
             _error(sink, None, -32600, "Invalid request")
@@ -167,27 +222,33 @@ def _session(
             ready = True
         elif method == "shutdown" and is_request:
             shutdown = True
+            pending = None
             _send(sink, id=request_id, result=None)
-        elif method == "textDocument/didSave" and not is_request and ready:
+        elif method == "textDocument/didSave" and not is_request and ready and pending is None:
             path = _save_path(message.get("params"), root)
             if path is None:
                 continue
             try:
                 notice = on_save(root, path)
             except Exception:
-                _send(sink, method="window/logMessage", params={
-                    "type": 1, "message": "Zed Transfer. Errore durante il caricamento automatico.",
+                return _save_failed(sink)
+            if isinstance(notice, SavePrompt):
+                prompt_id = f"zed-transfer-consent-{token_hex(16)}"
+                pending = (prompt_id, notice)
+                _send(sink, id=prompt_id, method="window/showMessageRequest", params={
+                    "type": 2,
+                    "message": notice.message,
+                    "actions": [{"title": _ACCEPT_UPLOAD}, {"title": _CANCEL_UPLOAD}],
                 })
-                return 1
-            if notice:
-                _send(sink, method="window/logMessage", params={"type": 3, "message": notice})
+            elif notice:
+                _log(sink, notice)
         elif is_request:
             _error(sink, request_id, -32601, "Method not found")
     return 0
 
 
 def run_lsp(
-    on_save: Callable[[Path, Path], str | None], *,
+    on_save: Callable[[Path, Path], str | SavePrompt | None], *,
     stdin: BinaryIO | None = None, stdout: BinaryIO | None = None,
 ) -> int:
     """Run a save-only LSP stdio session and close on EOF or framing error."""

@@ -1,5 +1,6 @@
 """Keep upload-on-save approvals in the user's private configuration directory."""
 
+import fcntl
 import hashlib
 import hmac
 import json
@@ -26,6 +27,9 @@ class Authorization:
     config_path: Path
     allow_config_password: bool
     _binding: str = field(repr=False)
+
+
+AutoUploadStatus = tuple[Authorization | None, bool]
 
 
 _STATE = (".config", "zed-transfer", "auto-upload")
@@ -108,12 +112,16 @@ def _binding(config: Config, allow_config_password: bool) -> str:
     return hashlib.sha256(json.dumps(data, separators=(",", ":")).encode("ascii")).hexdigest()
 
 
-def _parse_record(raw: bytes) -> Authorization:
+def _parse_record(raw: bytes) -> AutoUploadStatus:
     try:
         record = json.loads(raw)
-        if type(record) is not dict or set(record) != {
+        if type(record) is not dict or type(record.get("version")) is not int or record["version"] != 1:
+            raise ValueError
+        if set(record) == {"version", "disabled"} and record["disabled"] is True:
+            return None, True
+        if set(record) != {
             "version", "name", "profile", "config_path", "allow_config_password", "binding"
-        } or type(record["version"]) is not int or record["version"] != 1:
+        }:
             raise ValueError
         name, profile = record["name"], record["profile"]
         if any(value is not None and (not isinstance(value, str) or has_controls(value))
@@ -130,33 +138,98 @@ def _parse_record(raw: bytes) -> Authorization:
             raise ValueError
     except (ValueError, RecursionError):
         raise AuthorizationError("Autorizzazione non valida. Revocala e confermala di nuovo.") from None
-    return Authorization(name, profile, config_path, use_password, binding)
+    return Authorization(name, profile, config_path, use_password, binding), False
 
 
-def get_authorization(root: Path) -> Authorization | None:
-    """Read the active approval for a workspace, if it exists."""
-    root = _root(root)
-    with _state_directory(root) as directory:
-        if directory is None:
-            return None
-        try:
-            flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
-            with os.fdopen(os.open(_record_name(root), flags, dir_fd=directory), "rb") as record:
-                info = os.fstat(record.fileno())
-                if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                        or info.st_mode & 0o077 or info.st_nlink != 1):
-                    raise AuthorizationError("Il file di autorizzazione ha permessi o tipo non sicuri.")
-                raw = record.read(_MAX_RECORD + 1)
-        except FileNotFoundError:
-            return None
-        except OSError:
-            raise AuthorizationError("Impossibile leggere il file di autorizzazione.") from None
+def _assert_private_file(fd: int) -> None:
+    info = os.fstat(fd)
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+            or info.st_mode & 0o077 or info.st_nlink != 1):
+        raise AuthorizationError("Il file di autorizzazione ha permessi o tipo non sicuri.")
+
+
+def _read_status(directory: int, root: Path) -> AutoUploadStatus:
+    try:
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+        with os.fdopen(os.open(_record_name(root), flags, dir_fd=directory), "rb") as record:
+            _assert_private_file(record.fileno())
+            raw = record.read(_MAX_RECORD + 1)
+    except FileNotFoundError:
+        return None, False
+    except OSError:
+        raise AuthorizationError("Impossibile leggere il file di autorizzazione.") from None
     if len(raw) > _MAX_RECORD:
         raise AuthorizationError("Il file di autorizzazione supera la dimensione massima.")
     return _parse_record(raw)
 
 
-def authorize(config: Config, *, allow_config_password: bool) -> Authorization:
+def get_auto_upload_status(root: Path) -> AutoUploadStatus:
+    """Read an approval and whether the user explicitly disabled automatic upload."""
+    root = _root(root)
+    with _state_directory(root) as directory:
+        return _read_status(directory, root) if directory is not None else (None, False)
+
+
+def get_authorization(root: Path) -> Authorization | None:
+    """Read the active approval for a workspace, if it exists."""
+    approval, _ = get_auto_upload_status(root)
+    return approval
+
+
+@contextmanager
+def _update_lock(directory: int):
+    with ExitStack() as cleanup:
+        try:
+            flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
+            lock = os.open(".lock", flags, 0o600, dir_fd=directory)
+            cleanup.callback(os.close, lock)
+            _assert_private_file(lock)
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        except OSError:
+            raise AuthorizationError("Impossibile aggiornare l'autorizzazione.") from None
+        yield
+
+
+def _write_record(
+    root: Path, data: dict[str, object], expected_status: AutoUploadStatus | None
+) -> AutoUploadStatus:
+    raw = (json.dumps(data, ensure_ascii=False) + "\n").encode("utf-8")
+    if len(raw) > _MAX_RECORD:
+        raise AuthorizationError("Il file di autorizzazione supera la dimensione massima.")
+    with _state_directory(root, create=True) as directory, _update_lock(directory):
+        try:
+            current = _read_status(directory, root)
+        except AuthorizationError:
+            if expected_status is not None:
+                raise
+            current = (None, False)
+        if expected_status is not None and current != expected_status:
+            raise AuthorizationError("Lo stato dell'upload automatico è già cambiato.")
+
+        temporary = f".{uuid4().hex}.tmp"
+        written = False
+        try:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+            fd = os.open(temporary, flags, 0o600, dir_fd=directory)
+            written = True
+            with os.fdopen(fd, "wb") as record:
+                record.write(raw)
+                record.flush()
+                os.fsync(record.fileno())
+            os.replace(temporary, _record_name(root), src_dir_fd=directory, dst_dir_fd=directory)
+            written = False
+        except OSError:
+            raise AuthorizationError("Impossibile salvare l'autorizzazione.") from None
+        finally:
+            if written:
+                with suppress(OSError):
+                    os.unlink(temporary, dir_fd=directory)
+    return current
+
+
+def authorize(
+    config: Config, *, allow_config_password: bool, expected_status: AutoUploadStatus | None = None
+) -> Authorization:
     """Persist an approval after a user has confirmed the exact target."""
     config_path = config.source.relative_to(config.root)
     binding = _binding(config, allow_config_password)
@@ -168,28 +241,7 @@ def authorize(config: Config, *, allow_config_password: bool) -> Authorization:
         "allow_config_password": allow_config_password,
         "binding": binding,
     }
-    raw = (json.dumps(data, ensure_ascii=False) + "\n").encode("utf-8")
-    if len(raw) > _MAX_RECORD:
-        raise AuthorizationError("Il file di autorizzazione supera la dimensione massima.")
-    with _state_directory(config.root, create=True) as directory:
-        temporary = f".{uuid4().hex}.tmp"
-        written = False
-        try:
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
-            fd = os.open(temporary, flags, 0o600, dir_fd=directory)
-            written = True
-            with os.fdopen(fd, "wb") as record:
-                record.write(raw)
-                record.flush()
-                os.fsync(record.fileno())
-            os.replace(temporary, _record_name(config.root), src_dir_fd=directory, dst_dir_fd=directory)
-            written = False
-        except OSError:
-            raise AuthorizationError("Impossibile salvare l'autorizzazione.") from None
-        finally:
-            if written:
-                with suppress(OSError):
-                    os.unlink(temporary, dir_fd=directory)
+    _write_record(config.root, data, expected_status)
     return Authorization(config.name, config.profile, config_path, allow_config_password, binding)
 
 
@@ -203,16 +255,7 @@ def verify_authorization(approval: Authorization, config: Config) -> bool:
     )
 
 
-def revoke(root: Path) -> bool:
-    """Remove the approval for a workspace, including an unreadable approval file."""
-    root = _root(root)
-    with _state_directory(root) as directory:
-        if directory is None:
-            return False
-        try:
-            os.unlink(_record_name(root), dir_fd=directory)
-        except FileNotFoundError:
-            return False
-        except OSError:
-            raise AuthorizationError("Impossibile revocare l'autorizzazione.") from None
-    return True
+def revoke(root: Path, *, expected_status: AutoUploadStatus | None = None) -> bool:
+    """Disable automatic upload for the workspace until a new explicit approval."""
+    active, _ = _write_record(_root(root), {"version": 1, "disabled": True}, expected_status)
+    return active is not None

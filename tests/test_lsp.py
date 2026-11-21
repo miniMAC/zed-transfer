@@ -3,8 +3,13 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from zed_transfer.lsp import run_lsp
+from zed_transfer.lsp import SavePrompt, run_lsp
+
+
+_PROMPT_ID = "zed-transfer-consent-" + "a" * 32
+_ACCEPT = {"title": "Attiva upload automatico"}
 
 
 def _packet(payload):
@@ -17,6 +22,10 @@ def _message(method, **fields):
 
 def _save(uri):
     return _message("textDocument/didSave", params={"textDocument": {"uri": uri}})
+
+
+def _response(request_id=_PROMPT_ID, **fields):
+    return _packet(json.dumps({"jsonrpc": "2.0", "id": request_id, **fields}).encode())
 
 
 def _responses(output):
@@ -40,9 +49,10 @@ class LspTest(unittest.TestCase):
         self.uploads.append((root, file))
         return "Salvataggio ricevuto."
 
-    def run_packets(self, *packets):
+    def run_packets(self, *packets, on_save=None):
         destination = io.BytesIO()
-        status = run_lsp(self.on_save, stdin=io.BytesIO(b"".join(packets)), stdout=destination)
+        with patch("zed_transfer.lsp.token_hex", return_value="a" * 32):
+            status = run_lsp(on_save or self.on_save, stdin=io.BytesIO(b"".join(packets)), stdout=destination)
         return status, _responses(destination.getvalue())
 
     def initialize(self):
@@ -136,3 +146,75 @@ class LspTest(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual(responses[0]["error"]["code"], -32700)
         self.assertIn("result", responses[1])
+
+    def test_prompt_accepts_only_one_matching_response_with_exact_action(self):
+        file = self.root / "index.php"
+        uri = file.as_uri()
+        prompts = []
+
+        def ask(root, path):
+            prompts.append(path)
+            return SavePrompt("Consenti invii a sftp.example.com?", lambda: self.on_save(root, path))
+
+        status, responses = self.run_packets(
+            self.initialize(),
+            _message("initialized"),
+            _save(uri),
+            _save(uri),
+            _response("wrong-id", result=_ACCEPT),
+            _response(result={"title": "Attiva"}),
+            _response(result=_ACCEPT, error={"code": -32800, "message": "Canceled"}),
+            _response(result=_ACCEPT),
+            _response(result=_ACCEPT),
+            _message("shutdown", id=2),
+            _message("exit"),
+            on_save=ask,
+        )
+        self.assertEqual(status, 0)
+        self.assertEqual(prompts, [file])
+        self.assertEqual(self.uploads, [(self.root, file)])
+        self.assertEqual(responses[1], {
+            "jsonrpc": "2.0", "id": _PROMPT_ID, "method": "window/showMessageRequest",
+            "params": {"type": 2, "message": "Consenti invii a sftp.example.com?",
+                       "actions": [_ACCEPT, {"title": "Annulla"}]},
+        })
+        self.assertEqual(responses[2]["method"], "window/logMessage")
+
+    def test_prompt_cancellation_never_calls_accept(self):
+        file = self.root / "index.php"
+        uri = file.as_uri()
+        for response in (
+            _response(result=None),
+            _response(result={"title": "Annulla"}),
+            _response(error={"code": -32800, "message": "Canceled"}),
+        ):
+            with self.subTest(response=response):
+                prompts = []
+
+                def ask(root, path):
+                    prompts.append(path)
+                    if len(prompts) == 1:
+                        return SavePrompt("Attivare?", lambda: self.on_save(root, path))
+                    return None
+
+                status, _ = self.run_packets(
+                    self.initialize(), _message("initialized"), _save(uri), response,
+                    _response(result=_ACCEPT), _save(uri), on_save=ask,
+                )
+                self.assertEqual(status, 0)
+                self.assertEqual(prompts, [file, file])
+        self.assertEqual(self.uploads, [])
+
+    def test_shutdown_discards_prompt(self):
+        status, responses = self.run_packets(
+            self.initialize(),
+            _message("initialized"),
+            _save((self.root / "index.php").as_uri()),
+            _message("shutdown", id=2),
+            _response(result=_ACCEPT),
+            _message("exit"),
+            on_save=lambda root, file: SavePrompt("Attivare?", lambda: self.on_save(root, file)),
+        )
+        self.assertEqual(status, 0)
+        self.assertEqual(len(responses), 3)
+        self.assertEqual(self.uploads, [])
